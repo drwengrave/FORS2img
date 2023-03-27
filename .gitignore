@@ -1,0 +1,19 @@
+#-------------------
+# emacs
+*~
+*.elc
+[#]*[#]
+
+#-------------------
+# compiled files
+*.pyc
+#-------------------
+# Logs and databases
+
+#-------------------
+# OS junk
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
