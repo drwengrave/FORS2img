@@ -1,24 +1,32 @@
 description="quick reduction of fors imaging"
+"""
+FORS2 IMG DATA REDUCTION SCRIPT - v1.0 (2023)
+To run this script launch the command
+> python forsimg.py data_dir  (add -h for help/options)
+where data-dir is the directory with the raw data
+If a directory with master_bias and master_flat exists, these are used
+Combine dithered images for each object/filter/epoch
+REQUISITES: CPL libraries, astropy, ccdproc
+"""
 import os,sys,time,glob
 import numpy as np
+import imexam
+import subprocess
+import argparse
 from astropy.io import fits
 from ccdproc import cosmicray_lacosmic
 from astropy.stats import sigma_clipped_stats
-from photutils.datasets import load_star_image
 from photutils.detection import DAOStarFinder
 from scipy.ndimage import shift
 from astropy.nddata import CCDData
 from ccdproc import transform_image, combine
 from astropy import units as u
-import imexam
-import subprocess
-import argparse
 import logging
 
 start_time = time.time()
 parser = argparse.ArgumentParser(description=description,
                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("imglist",help="img to process (with path, allowing \*) ")
+parser.add_argument("path",help="path of raw images")
 parser.add_argument("-c","--caldir",help="master calibration directory",
                     default='caldir/')
 parser.add_argument("-l","--list",dest="list",action="store_true",
@@ -70,8 +78,9 @@ def read_desc(img): ####################################
 
 def group_data(_list):      
 
-    _imglist = args.imglist
-    filelist = glob.glob(f"{_imglist}")
+    _path = args.path
+    if _path[-1] != '/': _path += '/' 
+    filelist = glob.glob(f"{_path}*.fits")
     imglist = {}
     group = {}
 
@@ -89,24 +98,28 @@ def group_data(_list):
         
         imglist[_im] = imgkeys
 
+        o = imglist[_im]['object']
         f = imglist[_im]['filter']
         mjd = imglist[_im]['mjd']
-        if f not in group: group[f] = {}
-        if len(group[f].keys())==0: group[f][mjd] = [_im]
+        if o not in group: group[o] = {}
+        if f not in group[o]: group[o][f] = {}
+        if len(group[o][f].keys())==0: group[o][f][mjd] = [_im]
         else:
-            mjdlist = np.array(list(group[f].keys()))
+            mjdlist = np.array(list(group[o][f].keys()))
             mjdist = np.abs(mjdlist-mjd)
             ii = np.argmin(mjdist)
-            if mjdist[ii]<.5: group[f][mjdlist[ii]].append(_im)
-            else: group[f][mjd] = [_im]
-            
+            if mjdist[ii]<.5: group[o][f][mjdlist[ii]].append(_im)
+            else: group[o][f][mjd] = [_im]
+    
     if _list:
-        for f in group:
-            print(f'filter {f}')
-            for mjd in group[f]:
-                print(f'mjd {mjd}')
-                for im in group[f][mjd]:
-                    print(f"{im} {imglist[im]['object']} {imglist[im]['filter']} {imglist[im]['date'][:10]}")
+        for o in group:
+            for f in group[o]:
+                for mjd in group[o][f]:
+                    print(f' object: {o}  filter: {f}  mjd: {mjd:.4f} ',
+                          end='')
+                    for i,im in enumerate(group[o][f][mjd]):
+                        if i==0: print(imglist[im]['date'][:10])
+                        print(f"{im} {imglist[im]['object']}")
             
     return imglist,group
 
@@ -161,82 +174,88 @@ def clean_cosmics(img):   #############   correct cosmic rays ##########
    detcosm /= epadu
    imask = np.zeros(detcosm.shape) 
    imask[mask] = 1
-   if os.path.exists(img+'.fits'): os.remove(img+'.fits')
-   fits.writeto(img+'.fits',detcosm.value,hdulist[0].header)
-   if os.path.exists(f'_{img}.mask.fits'): os.remove(f'_{img}.mask.fits')
-   fits.writeto(f'_{img}.mask.fits',imask,hdulist[0].header)
+   fits.writeto(img+'.fits',detcosm.value,hdulist[0].header,
+                output_verify='silentfix',overwrite=True)
+   fits.writeto(f'_{img}.mask.fits',imask,hdulist[0].header,
+                output_verify='silentfix',overwrite=True)
 
 
 def cdither(imglist,group):
 
-    for f in group:
-        for mjd in group[f]:
-            xshift,yshift = [0.],[0.]
-            shifted = []
-            for i,o in enumerate(group[f][mjd]):
-                data = fits.getdata(f"r_{o}.fits")
-                imglist[o]['data'] = data
-                mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-                imglist[o]['data'] -= median
-                daofind = DAOStarFinder(fwhm=4.0, threshold=10.*std)  
-                sources = daofind(imglist[o]['data'])  
-                ii = np.argsort(sources['flux'])
-                sources = sources[ii][:50]
+    for o in group:
+        for f in group[o]:
+            for mjd in group[o][f]:
+                xshift,yshift = [0.],[0.]
+                shifted = []
+                for i,img in enumerate(group[o][f][mjd]):
+
+                    data = fits.getdata(f"r_{img}.fits")
+                    imglist[img]['data'] = data
+                    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+                    imglist[img]['data'] -= median
+                    daofind = DAOStarFinder(fwhm=4.0, threshold=10.*std)  
+                    sources = daofind(imglist[img]['data'])  
+                    ii = np.argsort(sources['flux'])
+                    sources = sources[ii][:50]
                 
-                if i == 0:
-                    rsources = sources
-                    dd = imglist[o]['date'][:10]
-                    logger.info(f"{o} reference")
-                    continue
+                    if i == 0:
+                        rsources = sources
+                        dd = imglist[img]['date'][:10]
+                        logger.info(f"{img} reference")
+                        continue
 
-                dx,dy,dist = [],[],[]
-                step = 3.
-                for r in rsources:
-                    _dx = r['xcentroid']-sources['xcentroid']
-                    _dy = r['ycentroid']-sources['ycentroid']
-                    _dist = np.sqrt(_dx**2 + _dy**2)
-                    dx.append(_dx)
-                    dy.append(_dy)
-                    dist.append(_dist)
+                    dx,dy,dist = [],[],[]
+                    step = 3.
+                    for r in rsources:
+                        _dx = r['xcentroid']-sources['xcentroid']
+                        _dy = r['ycentroid']-sources['ycentroid']
+                        _dist = np.sqrt(_dx**2 + _dy**2)
+                        dx.append(_dx)
+                        dy.append(_dy)
+                        dist.append(_dist)
 
-                dx = np.array(dx)
-                dy = np.array(dy)
-                dist = np.array(dist)
+                    dx = np.array(dx)
+                    dy = np.array(dy)
+                    dist = np.array(dist)
         
-                hist, bins = np.histogram(dist.ravel(),bins=np.arange(0,300.,step))
-                dmean = bins[np.argmax(hist)] + step/2.
-                ii = np.abs(dist - dmean) < step/2.
-                _xshift = np.median(dx[ii])
-                _yshift = np.median(dy[ii])
-                logger.info(f"{o} {_xshift:6.2f} {_yshift:6.2f}")
-                xshift.append(_xshift)
-                yshift.append(_yshift)
+                    hist, bins = np.histogram(dist.ravel(),
+                                              bins=np.arange(0,300.,step))
+                    dmean = bins[np.argmax(hist)] + step/2.
+                    ii = np.abs(dist - dmean) < step/2.
+                    _xshift = np.median(dx[ii])
+                    _yshift = np.median(dy[ii])
+                    logger.info(f"{img} {_xshift:6.2f} {_yshift:6.2f}")
+                    xshift.append(_xshift)
+                    yshift.append(_yshift)
 
-        shifted = []
-        viewer = imexam.connect('ds9')
-        for i,o in enumerate(group[f][mjd]):            
-            ccd = CCDData(imglist[o]['data'],unit=u.adu)
-            if i==0: _shifted = ccd
-            else:
-                _shifted = transform_image(ccd,shift, shift=(yshift[i],
-                                                         xshift[i]))
-            shifted.append(_shifted)
 
-        stacked_image = combine(shifted,clip_extrema=True)
+            shifted = []
+            for i,img in enumerate(group[o][f][mjd]):            
+                ccd = CCDData(imglist[img]['data'],unit=u.adu)
+                if i==0: _shifted = ccd
+                else:
+                    _shifted = transform_image(ccd,shift,
+                                    shift=(yshift[i],xshift[i]))
+                shifted.append(_shifted)
 
-        x1 = int(np.max(xshift))+1
-        y1 = int(np.max(yshift))+1
-        x2 = int(np.min(xshift))
-        y2 = int(np.min(yshift))
+            if len(shifted)>3:
+                stacked_image = combine(shifted,method='average',
+                                        clip_extrema=True)
+            else: stacked_image = combine(shifted,method='average')
 
-        ndim = stacked_image.shape
-        trim_img = stacked_image[y1:ndim[0]+y2,x1:ndim[1]+x2]
-        dfile(f'{f}_{dd}.fits')
-        hdr = fits.getheader(f"r_{group[f][mjd][0]}.fits")
-        hdr['CRPIX1'] = hdr['CRPIX1']-x1
-        hdr['CRPIX2'] = hdr['CRPIX2']-y1
-        fits.writeto(f"{f}_{dd}.fits",trim_img,hdr)
-        logger.info(f"produced file {f}_{dd}.fits")
+            x1 = int(np.max(xshift))+1
+            y1 = int(np.max(yshift))+1
+            x2 = int(np.min(xshift))
+            y2 = int(np.min(yshift))
+
+            ndim = stacked_image.shape
+            trim_img = stacked_image[y1:ndim[0]+y2,x1:ndim[1]+x2]
+            hdr = fits.getheader(f"r_{group[o][f][mjd][0]}.fits")
+            hdr['CRPIX1'] = hdr['CRPIX1']-x1
+            hdr['CRPIX2'] = hdr['CRPIX2']-y1
+            
+            fits.writeto(f"{o}_{f}_{dd}.fits",trim_img,hdr,overwrite=True)
+            logger.info(f"combined img {o}_{f}_{dd}.fits")
          
 if __name__ == "__main__":
     
